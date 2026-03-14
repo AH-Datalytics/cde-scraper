@@ -25,8 +25,6 @@ API_KEY = os.environ.get("CDE_API_KEY", "BPkjHOgf6hpOoYlRm7GOaHbSQqlx87IfiXP3QTJ
 BASE = "https://cde.ucr.cjis.gov/LATEST"
 
 OFFENSE_TYPES = [
-    "violent-crime",
-    "property-crime",
     "homicide",
     "rape",
     "robbery",
@@ -279,8 +277,6 @@ async def scrape_all(from_date, to_date, concurrency):
 
 # Map CDE offense slugs to pipeline-friendly column names
 OFFENSE_COL_MAP = {
-    "violent-crime":      "violent_crime",
-    "property-crime":     "property_crime",
     "homicide":           "homicide",
     "rape":               "rape",
     "robbery":            "robbery",
