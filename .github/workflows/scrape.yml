@@ -1,0 +1,60 @@
+name: CDE SRS Scrape
+
+on:
+  schedule:
+    # 11:15 AM ET on the 15th of every month
+    # EDT (Mar-Nov): 11:15 AM = 15:15 UTC
+    # EST (Nov-Mar): 11:15 AM = 16:15 UTC
+    - cron: '15 15 15 * *'
+    - cron: '15 16 15 * *'
+    # 12:15 PM ET on the 15th of every month
+    # EDT: 12:15 PM = 16:15 UTC (covered above)
+    # EST: 12:15 PM = 17:15 UTC
+    - cron: '15 17 15 * *'
+  workflow_dispatch:
+    inputs:
+      from_date:
+        description: 'Start date (MM-YYYY)'
+        required: false
+        default: '01-2017'
+      to_date:
+        description: 'End date (MM-YYYY, blank = current month)'
+        required: false
+        default: ''
+
+jobs:
+  scrape:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install dependencies
+        run: pip install aiohttp
+
+      - name: Run scraper
+        run: |
+          FROM="${{ github.event.inputs.from_date || '01-2017' }}"
+          TO="${{ github.event.inputs.to_date }}"
+          if [ -z "$TO" ]; then
+            TO="$(date +%m-%Y)"
+          fi
+          python scraper.py --from "$FROM" --to "$TO" --concurrency 15 --output cde_data.csv
+
+      - name: Commit results
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add cde_data.csv
+          if git diff --cached --quiet; then
+            echo "No changes to commit"
+          else
+            ROWS=$(wc -l < cde_data.csv)
+            git commit -m "Update CDE data — $(date +%Y-%m-%d) — $((ROWS - 1)) rows"
+            git push
+          fi
