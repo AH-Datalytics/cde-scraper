@@ -22,6 +22,9 @@ on:
         required: false
         default: ''
 
+permissions:
+  contents: write
+
 jobs:
   scrape:
     runs-on: ubuntu-latest
@@ -44,7 +47,7 @@ jobs:
           if [ -z "$TO" ]; then
             TO="$(date +%m-%Y)"
           fi
-          python scraper.py --from "$FROM" --to "$TO" --concurrency 15 --output cde_data.csv
+          python scraper.py --from "$FROM" --to "$TO" --concurrency 10 --output cde_data.csv
 
       - name: Commit results
         run: |
