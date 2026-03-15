@@ -2,11 +2,14 @@
 FBI Crime Data Explorer — SRS Agency Scraper (async)
 Pulls summarized agency-level crime data for RTCI ORIs.
 
+Uses short offense codes (ASS, HOM, etc.) with type=counts for faster,
+leaner responses from the CDE API.
+
 Usage:
     python scraper.py                         # 2017 to current month
     python scraper.py --from 01-2023          # custom start
     python scraper.py --to 12-2024            # custom end
-    python scraper.py --concurrency 20        # more parallel requests
+    python scraper.py --concurrency 10        # parallel requests
     python scraper.py --output my_file.csv    # custom filename
 """
 
@@ -17,22 +20,21 @@ import csv
 import time
 import os
 from datetime import datetime
-from collections import defaultdict
 
 # ─── Configuration ───────────────────────────────────────────────────────────
 
-API_KEY = os.environ.get("CDE_API_KEY", "BPkjHOgf6hpOoYlRm7GOaHbSQqlx87IfiXP3QTJg")
 BASE = "https://cde.ucr.cjis.gov/LATEST"
 
-OFFENSE_TYPES = [
-    "homicide",
-    "rape",
-    "robbery",
-    "aggravated-assault",
-    "burglary",
-    "larceny",
-    "motor-vehicle-theft",
-]
+# Short CDE offense codes -> pipeline column names
+OFFENSE_CODES = {
+    "HOM": "homicide",
+    "RPE": "rape",
+    "ROB": "robbery",
+    "ASS": "aggravated_assault",
+    "BUR": "burglary",
+    "LAR": "larceny",
+    "MVT": "motor_vehicle_theft",
+}
 
 STATE_NAMES = {
     "Alabama","Alaska","Arizona","Arkansas","California","Colorado","Connecticut",
@@ -184,38 +186,52 @@ ORI_LIST = [
 
 # ─── Async scraper ───────────────────────────────────────────────────────────
 
-MAX_RETRIES = 3
+MAX_RETRIES = 4
 RETRY_DELAY = 2.0
 
 
-async def fetch_one(session, sem, ori, offense, from_date, to_date, results, errors_list, progress):
-    url = f"{BASE}/summarized/agency/{ori}/{offense}"
-    params = {"from": from_date, "to": to_date, "api_key": API_KEY}
+async def fetch_one(session, sem, ori, code, col_name, from_date, to_date,
+                    results, errors_list, progress):
+    url = f"{BASE}/summarized/agency/{ori}/{code}"
+    params = {"from": from_date, "to": to_date, "type": "counts"}
 
     for attempt in range(MAX_RETRIES):
         async with sem:
             try:
-                async with session.get(url, params=params, timeout=aiohttp.ClientTimeout(total=30)) as resp:
+                async with session.get(url, params=params,
+                                       timeout=aiohttp.ClientTimeout(total=30)) as resp:
                     if resp.status == 429:
                         wait = RETRY_DELAY * (2 ** attempt)
                         await asyncio.sleep(wait)
                         continue
+                    if resp.status == 400:
+                        # No data for this ORI/offense combo
+                        progress["done"] += 1
+                        return
                     resp.raise_for_status()
                     data = await resp.json()
 
+                    # Parse actuals - find the agency-specific keys (not US/state)
                     actuals = data.get("offenses", {}).get("actuals", {})
-                    off_keys = [k for k in actuals if k.endswith("Offenses") and "United States" not in k]
-                    clr_keys = [k for k in actuals if k.endswith("Clearances") and "United States" not in k]
+                    off_keys = [k for k in actuals
+                                if k.endswith("Offenses")
+                                and "United States" not in k]
+                    clr_keys = [k for k in actuals
+                                if k.endswith("Clearances")
+                                and "United States" not in k]
                     off_key = off_keys[0] if off_keys else None
                     clr_key = clr_keys[0] if clr_keys else None
 
+                    # Agency name (from first successful response)
                     if off_key and ori not in results["names"]:
                         results["names"][ori] = off_key.replace(" Offenses", "")
 
+                    # Population (from first successful response)
                     if ori not in results["pops"]:
                         pop_dict = data.get("populations", {}).get("population", {})
                         pop_key = next((k for k in pop_dict
-                                        if k != "United States" and k not in STATE_NAMES), None)
+                                        if k != "United States"
+                                        and k not in STATE_NAMES), None)
                         if pop_key:
                             pop_vals = list(pop_dict[pop_key].values())
                             if pop_vals:
@@ -225,24 +241,25 @@ async def fetch_one(session, sem, ori, offense, from_date, to_date, results, err
                     clearance_data = actuals.get(clr_key, {}) if clr_key else {}
 
                     for date_key, val in offense_data.items():
-                        results["data"][(ori, offense, date_key)] = {
+                        results["data"][(ori, col_name, date_key)] = {
                             "actual": val,
                             "cleared": clearance_data.get(date_key),
                         }
 
                     progress["done"] += 1
-                    if progress["done"] % 100 == 0 or progress["done"] == progress["total"]:
-                        pct = progress["done"] / progress["total"] * 100
+                    done = progress["done"]
+                    if done % 100 == 0 or done == progress["total"]:
+                        pct = done / progress["total"] * 100
                         elapsed = time.time() - progress["start"]
-                        rate = progress["done"] / elapsed if elapsed > 0 else 0
-                        eta = (progress["total"] - progress["done"]) / rate if rate > 0 else 0
-                        print(f"\r  {progress['done']:,}/{progress['total']:,} ({pct:.0f}%) "
-                              f"- {rate:.0f} req/s, ETA {eta:.0f}s", end="", flush=True)
+                        rate = done / elapsed if elapsed > 0 else 0
+                        eta = (progress["total"] - done) / rate if rate > 0 else 0
+                        print(f"  {done:,}/{progress['total']:,} ({pct:.0f}%) "
+                              f"- {rate:.0f} req/s, ETA {eta:.0f}s")
                     return
 
             except (aiohttp.ClientError, asyncio.TimeoutError) as e:
                 if attempt == MAX_RETRIES - 1:
-                    errors_list.append({"ori": ori, "offense": offense, "error": str(e)})
+                    errors_list.append({"ori": ori, "offense": code, "error": str(e)})
                     progress["done"] += 1
                 else:
                     await asyncio.sleep(RETRY_DELAY * (2 ** attempt))
@@ -251,12 +268,13 @@ async def fetch_one(session, sem, ori, offense, from_date, to_date, results, err
 async def scrape_all(from_date, to_date, concurrency):
     results = {"data": {}, "names": {}, "pops": {}}
     errors_list = []
-    total = len(ORI_LIST) * len(OFFENSE_TYPES)
+    total = len(ORI_LIST) * len(OFFENSE_CODES)
     progress = {"done": 0, "total": total, "start": time.time()}
 
-    print(f"  {len(ORI_LIST)} ORIs x {len(OFFENSE_TYPES)} offenses = {total:,} requests")
+    print(f"  {len(ORI_LIST)} ORIs x {len(OFFENSE_CODES)} offenses = {total:,} requests")
     print(f"  Concurrency: {concurrency}")
     print(f"  Date range: {from_date} to {to_date}")
+    print()
 
     sem = asyncio.Semaphore(concurrency)
     connector = aiohttp.TCPConnector(limit=concurrency, limit_per_host=concurrency)
@@ -264,8 +282,9 @@ async def scrape_all(from_date, to_date, concurrency):
     async with aiohttp.ClientSession(connector=connector) as session:
         tasks = []
         for ori in ORI_LIST:
-            for offense in OFFENSE_TYPES:
-                tasks.append(fetch_one(session, sem, ori, offense, from_date, to_date,
+            for code, col_name in OFFENSE_CODES.items():
+                tasks.append(fetch_one(session, sem, ori, code, col_name,
+                                       from_date, to_date,
                                        results, errors_list, progress))
         await asyncio.gather(*tasks)
 
@@ -275,25 +294,13 @@ async def scrape_all(from_date, to_date, concurrency):
 
 # ─── Output ──────────────────────────────────────────────────────────────────
 
-# Map CDE offense slugs to pipeline-friendly column names
-OFFENSE_COL_MAP = {
-    "homicide":           "homicide",
-    "rape":               "rape",
-    "robbery":            "robbery",
-    "aggravated-assault": "aggravated_assault",
-    "burglary":           "burglary",
-    "larceny":            "larceny",
-    "motor-vehicle-theft":"motor_vehicle_theft",
-}
-
-
 def build_csv(results, output_file):
     data = results["data"]
     names = results["names"]
     pops = results["pops"]
 
     all_dates = set()
-    for (ori, offense, date_key) in data:
+    for (ori, col_name, date_key) in data:
         all_dates.add(date_key)
 
     rows = []
@@ -313,11 +320,10 @@ def build_csv(results, output_file):
             }
 
             has_data = False
-            for offense in OFFENSE_TYPES:
-                col = OFFENSE_COL_MAP[offense]
-                rec = data.get((ori, offense, date_key), {})
-                row[f"{col}_actual"] = rec.get("actual", None)
-                row[f"{col}_cleared"] = rec.get("cleared", None)
+            for col_name in OFFENSE_CODES.values():
+                rec = data.get((ori, col_name, date_key), {})
+                row[f"{col_name}_actual"] = rec.get("actual", None)
+                row[f"{col_name}_cleared"] = rec.get("cleared", None)
                 if rec:
                     has_data = True
 
@@ -328,10 +334,9 @@ def build_csv(results, output_file):
 
     base_cols = ["ori", "agency_name", "state", "population", "year", "month"]
     offense_cols = []
-    for offense in OFFENSE_TYPES:
-        col = OFFENSE_COL_MAP[offense]
-        offense_cols.append(f"{col}_actual")
-        offense_cols.append(f"{col}_cleared")
+    for col_name in OFFENSE_CODES.values():
+        offense_cols.append(f"{col_name}_actual")
+        offense_cols.append(f"{col_name}_cleared")
     fieldnames = base_cols + offense_cols
 
     with open(output_file, "w", newline="", encoding="utf-8") as f:
@@ -350,7 +355,7 @@ def main():
     now = datetime.now()
     parser.add_argument("--from", dest="from_date", default="01-2017")
     parser.add_argument("--to", dest="to_date", default=f"{now.month:02d}-{now.year}")
-    parser.add_argument("--concurrency", type=int, default=15)
+    parser.add_argument("--concurrency", type=int, default=10)
     parser.add_argument("--output", default="cde_data.csv")
     args = parser.parse_args()
 
@@ -361,7 +366,7 @@ def main():
     results, errors_list = asyncio.run(scrape_all(args.from_date, args.to_date, args.concurrency))
     elapsed_scrape = time.time() - start
 
-    print(f"\n  Scraping done in {elapsed_scrape:.1f}s ({len(errors_list)} errors)")
+    print(f"  Scraping done in {elapsed_scrape:.1f}s ({len(errors_list)} errors)")
 
     if errors_list:
         print(f"  First errors:")
