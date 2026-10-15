@@ -19,6 +19,7 @@ import argparse
 import csv
 import time
 import os
+import sys
 from datetime import datetime
 
 # ─── Configuration ───────────────────────────────────────────────────────────
@@ -186,90 +187,118 @@ ORI_LIST = [
 
 # ─── Async scraper ───────────────────────────────────────────────────────────
 
-MAX_RETRIES = 4
+MAX_RETRIES = 6
 RETRY_DELAY = 2.0
+
+
+def _record(data, ori, col_name, results):
+    # Parse actuals - find the agency-specific keys (not US/state)
+    actuals = data.get("offenses", {}).get("actuals", {})
+    off_keys = [k for k in actuals
+                if k.endswith("Offenses")
+                and "United States" not in k]
+    clr_keys = [k for k in actuals
+                if k.endswith("Clearances")
+                and "United States" not in k]
+    off_key = off_keys[0] if off_keys else None
+    clr_key = clr_keys[0] if clr_keys else None
+
+    # Agency name (from first successful response)
+    if off_key and ori not in results["names"]:
+        results["names"][ori] = off_key.replace(" Offenses", "")
+
+    # Population (from first successful response)
+    if ori not in results["pops"]:
+        pop_dict = data.get("populations", {}).get("population", {})
+        pop_key = next((k for k in pop_dict
+                        if k != "United States"
+                        and k not in STATE_NAMES), None)
+        if pop_key:
+            pop_vals = list(pop_dict[pop_key].values())
+            if pop_vals:
+                results["pops"][ori] = pop_vals[0]
+
+    offense_data = actuals.get(off_key, {}) if off_key else {}
+    clearance_data = actuals.get(clr_key, {}) if clr_key else {}
+
+    for date_key, val in offense_data.items():
+        results["data"][(ori, col_name, date_key)] = {
+            "actual": val,
+            "cleared": clearance_data.get(date_key),
+        }
+
+
+def _tick(progress, errors_list):
+    progress["done"] += 1
+    done = progress["done"]
+    if done % 100 == 0 or done == progress["total"]:
+        pct = done / progress["total"] * 100
+        elapsed = time.time() - progress["start"]
+        rate = done / elapsed if elapsed > 0 else 0
+        eta = (progress["total"] - done) / rate if rate > 0 else 0
+        print(f"  {done:,}/{progress['total']:,} ({pct:.0f}%) "
+              f"- {rate:.0f} req/s, ETA {eta:.0f}s, "
+              f"{len(errors_list)} errors, {progress['throttled']} throttled", flush=True)
 
 
 async def fetch_one(session, sem, ori, code, col_name, from_date, to_date,
                     results, errors_list, progress):
     url = f"{BASE}/summarized/agency/{ori}/{code}"
     params = {"from": from_date, "to": to_date, "type": "counts"}
+    last_error = "no response"
 
     for attempt in range(MAX_RETRIES):
+        # If any worker was throttled, everyone waits out the shared pause before sending.
+        while time.time() < progress["pause_until"]:
+            await asyncio.sleep(min(1.0, progress["pause_until"] - time.time()))
+        backoff = None
         async with sem:
             try:
                 async with session.get(url, params=params,
                                        timeout=aiohttp.ClientTimeout(total=30)) as resp:
-                    if resp.status == 429:
-                        wait = RETRY_DELAY * (2 ** attempt)
-                        await asyncio.sleep(wait)
-                        continue
                     if resp.status == 400:
                         # No data for this ORI/offense combo
-                        progress["done"] += 1
+                        _tick(progress, errors_list)
                         return
-                    resp.raise_for_status()
-                    data = await resp.json()
-
-                    # Parse actuals - find the agency-specific keys (not US/state)
-                    actuals = data.get("offenses", {}).get("actuals", {})
-                    off_keys = [k for k in actuals
-                                if k.endswith("Offenses")
-                                and "United States" not in k]
-                    clr_keys = [k for k in actuals
-                                if k.endswith("Clearances")
-                                and "United States" not in k]
-                    off_key = off_keys[0] if off_keys else None
-                    clr_key = clr_keys[0] if clr_keys else None
-
-                    # Agency name (from first successful response)
-                    if off_key and ori not in results["names"]:
-                        results["names"][ori] = off_key.replace(" Offenses", "")
-
-                    # Population (from first successful response)
-                    if ori not in results["pops"]:
-                        pop_dict = data.get("populations", {}).get("population", {})
-                        pop_key = next((k for k in pop_dict
-                                        if k != "United States"
-                                        and k not in STATE_NAMES), None)
-                        if pop_key:
-                            pop_vals = list(pop_dict[pop_key].values())
-                            if pop_vals:
-                                results["pops"][ori] = pop_vals[0]
-
-                    offense_data = actuals.get(off_key, {}) if off_key else {}
-                    clearance_data = actuals.get(clr_key, {}) if clr_key else {}
-
-                    for date_key, val in offense_data.items():
-                        results["data"][(ori, col_name, date_key)] = {
-                            "actual": val,
-                            "cleared": clearance_data.get(date_key),
-                        }
-
-                    progress["done"] += 1
-                    done = progress["done"]
-                    if done % 100 == 0 or done == progress["total"]:
-                        pct = done / progress["total"] * 100
-                        elapsed = time.time() - progress["start"]
-                        rate = done / elapsed if elapsed > 0 else 0
-                        eta = (progress["total"] - done) / rate if rate > 0 else 0
-                        print(f"  {done:,}/{progress['total']:,} ({pct:.0f}%) "
-                              f"- {rate:.0f} req/s, ETA {eta:.0f}s")
-                    return
-
+                    if resp.status == 429:
+                        last_error = "HTTP 429 (throttled)"
+                        progress["throttled"] += 1
+                        backoff = min(RETRY_DELAY * (2 ** attempt), 15.0)
+                        progress["pause_until"] = max(progress["pause_until"], time.time() + backoff)
+                    elif resp.status >= 400:
+                        last_error = f"HTTP {resp.status}"
+                        backoff = min(RETRY_DELAY * (2 ** attempt), 15.0)
+                    else:
+                        data = await resp.json()
+                        _record(data, ori, col_name, results)
+                        _tick(progress, errors_list)
+                        return
             except (aiohttp.ClientError, asyncio.TimeoutError) as e:
-                if attempt == MAX_RETRIES - 1:
-                    errors_list.append({"ori": ori, "offense": code, "error": str(e)})
-                    progress["done"] += 1
-                else:
-                    await asyncio.sleep(RETRY_DELAY * (2 ** attempt))
+                last_error = str(e) or type(e).__name__
+                backoff = min(RETRY_DELAY * (2 ** attempt), 15.0)
+        # Back off AFTER releasing the request slot so other workers are not blocked.
+        if backoff is not None and attempt < MAX_RETRIES - 1:
+            await asyncio.sleep(backoff)
+
+    # Out of retries: record it. (Previously a throttled request was dropped without a trace.)
+    errors_list.append({"ori": ori, "offense": code, "error": last_error})
+    _tick(progress, errors_list)
+
+
+async def _heartbeat(progress, errors_list):
+    """Log every 30s so a stall is visible instead of a silent log."""
+    while True:
+        await asyncio.sleep(30)
+        print(f"  [heartbeat] {progress['done']:,}/{progress['total']:,} done, "
+              f"{len(errors_list)} errors, {progress['throttled']} throttled", flush=True)
 
 
 async def scrape_all(from_date, to_date, concurrency):
     results = {"data": {}, "names": {}, "pops": {}}
     errors_list = []
     total = len(ORI_LIST) * len(OFFENSE_CODES)
-    progress = {"done": 0, "total": total, "start": time.time()}
+    progress = {"done": 0, "total": total, "start": time.time(),
+                "pause_until": 0.0, "throttled": 0}
 
     print(f"  {len(ORI_LIST)} ORIs x {len(OFFENSE_CODES)} offenses = {total:,} requests")
     print(f"  Concurrency: {concurrency}")
@@ -286,7 +315,11 @@ async def scrape_all(from_date, to_date, concurrency):
                 tasks.append(fetch_one(session, sem, ori, code, col_name,
                                        from_date, to_date,
                                        results, errors_list, progress))
-        await asyncio.gather(*tasks)
+        beat = asyncio.create_task(_heartbeat(progress, errors_list))
+        try:
+            await asyncio.gather(*tasks)
+        finally:
+            beat.cancel()
 
     print()
     return results, errors_list
@@ -375,8 +408,29 @@ def main():
         if len(errors_list) > 10:
             print(f"    ... and {len(errors_list) - 10} more")
 
+    # Gate 1: too many failed requests means the data is incomplete. Fail the job so nothing is committed.
+    total_requests = len(ORI_LIST) * len(OFFENSE_CODES)
+    max_errors = max(10, int(total_requests * 0.02))
+    if len(errors_list) > max_errors:
+        print(f"\nFAILED: {len(errors_list):,} of {total_requests:,} requests failed (limit {max_errors:,}). "
+              f"Not writing {args.output}.")
+        sys.exit(1)
+
     print(f"\nBuilding CSV...")
-    row_count = build_csv(results, args.output)
+    tmp_output = args.output + ".tmp"
+    row_count = build_csv(results, tmp_output)
+
+    # Gate 2: a full pull should not shrink the existing file by more than 10%.
+    if args.from_date == "01-2017" and os.path.exists(args.output):
+        with open(args.output, encoding="utf-8") as f:
+            old_rows = max(0, sum(1 for _ in f) - 1)
+        if old_rows and row_count < old_rows * 0.9:
+            print(f"\nFAILED: new file has {row_count:,} rows vs {old_rows:,} in the existing "
+                  f"{args.output} (under 90%). Keeping the existing file.")
+            os.remove(tmp_output)
+            sys.exit(1)
+
+    os.replace(tmp_output, args.output)
     print(f"  {row_count:,} rows written to {args.output}")
 
     total_elapsed = time.time() - start
