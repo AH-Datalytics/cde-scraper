@@ -41,6 +41,9 @@ jobs:
         run: pip install aiohttp
 
       - name: Run scraper
+        env:
+          # Unbuffered output so the progress lines and ETA show live in the Actions log.
+          PYTHONUNBUFFERED: '1'
         run: |
           FROM="${{ github.event.inputs.from_date || '01-2017' }}"
           TO="${{ github.event.inputs.to_date }}"
